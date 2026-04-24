@@ -5,17 +5,26 @@
  * Triggered capture mode:
  *   - Burst thread waits for capture_ready flag
  *   - Flag is set by SAADC EVT_DONE after 1024 samples are collected
- *   - SAADC sampling is started by CMD characteristic write (0x01 from receiver)
+ *   - SAADC sampling started by EPC901 READ pulse after SHUTTER + DATA_RDY
  *   - TIMER22 drives SAADC via DPPI — no CPU involvement during sampling
  *   - One frame captured and transmitted per trigger
  *
- * ADC pin: AIN4 = P1.11 (nRF54L15)
- * Timer:   TIMER22 @ 16 MHz, 1 µs compare → 1 Msps
+ * ADC pin:  AIN4 = P1.11 (nRF54L15)
+ * Timer:    TIMER22 @ 16 MHz, 1 µs compare → 1 Msps
+ *
+ * EPC901 GPIO pins — TODO: replace with real pin numbers from PCB schematic
+ *   SHUTTER   → GPIO output
+ *   READ      → GPIO output
+ *   CLR_DATA  → GPIO output
+ *   CLR_PIX   → GPIO output
+ *   DATA_RDY  → GPIO input
  */
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/printk.h>
+#include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/i2c.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gatt.h>
@@ -58,6 +67,25 @@ LOG_MODULE_REGISTER(EPC901_Transmitter, LOG_LEVEL_INF);
 BUILD_ASSERT(SAMPLES_PER_FRAME % 4 == 0, "SAMPLES_PER_FRAME must be a multiple of 4");
 
 /* --------------------------------------------------------------------------
+ * EPC901 GPIO Pin Definitions
+ * TODO: Replace placeholder pin numbers with real values from PCB schematic.
+ * Format: NRF_PIN_PORT_TO_PIN_NUMBER(pin, port)
+ *   port 0 = P0.xx, port 1 = P1.xx
+ * -------------------------------------------------------------------------- */
+#define EPC901_SHUTTER_PIN   NRF_PIN_PORT_TO_PIN_NUMBER(0U, 0)  /* TODO: P0.00 placeholder */
+#define EPC901_READ_PIN      NRF_PIN_PORT_TO_PIN_NUMBER(1U, 0)  /* TODO: P0.01 placeholder */
+#define EPC901_CLR_DATA_PIN  NRF_PIN_PORT_TO_PIN_NUMBER(4U, 0)  /* TODO: P0.04 placeholder */
+#define EPC901_CLR_PIX_PIN   NRF_PIN_PORT_TO_PIN_NUMBER(5U, 1)  /* TODO: P1.05 placeholder */
+#define EPC901_DATA_RDY_PIN  NRF_PIN_PORT_TO_PIN_NUMBER(6U, 1)  /* TODO: P1.06 placeholder */
+
+/* --------------------------------------------------------------------------
+ * EPC901 I2C
+ * TODO: Replace I2C address once CS0/CS1 pin config confirmed from schematic.
+ * Run i2c_scan() at first power-on to discover actual address.
+ * -------------------------------------------------------------------------- */
+#define EPC901_I2C_ADDR  0x10  /* TODO: confirm from PCB schematic CS0/CS1 config */
+
+/* --------------------------------------------------------------------------
  * ADC / Timer setup (nRF54L15-specific)
  * -------------------------------------------------------------------------- */
 #define NRF_SAADC_INPUT_AIN4   NRF_PIN_PORT_TO_PIN_NUMBER(11U, 1)
@@ -70,6 +98,13 @@ static const nrfx_timer_t     timer_instance = NRFX_TIMER_INSTANCE(TIMER_INSTANC
 /* Double-buffer for SAADC */
 static int16_t saadc_buf[2][SAMPLES_PER_FRAME];
 static uint32_t saadc_current_buffer = 0;
+
+/* --------------------------------------------------------------------------
+ * Device handles
+ * -------------------------------------------------------------------------- */
+static const struct device *gpio0_dev;
+static const struct device *gpio1_dev;
+static const struct device *i2c_dev;
 
 /* --------------------------------------------------------------------------
  * BLE state
@@ -265,6 +300,152 @@ static void configure_ppi(void)
 }
 
 /* --------------------------------------------------------------------------
+ * EPC901 GPIO Init
+ * TODO: Update pin numbers once PCB schematic is available.
+ * -------------------------------------------------------------------------- */
+static int epc901_gpio_init(void)
+{
+    gpio0_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
+    gpio1_dev = DEVICE_DT_GET(DT_NODELABEL(gpio1));
+
+    if (!device_is_ready(gpio0_dev) || !device_is_ready(gpio1_dev)) {
+        LOG_ERR("GPIO devices not ready");
+        return -1;
+    }
+
+    /* Outputs — drive low by default */
+    gpio_pin_configure(gpio0_dev, NRF_GET_PIN(EPC901_SHUTTER_PIN),  GPIO_OUTPUT_LOW);
+    gpio_pin_configure(gpio0_dev, NRF_GET_PIN(EPC901_READ_PIN),     GPIO_OUTPUT_LOW);
+    gpio_pin_configure(gpio0_dev, NRF_GET_PIN(EPC901_CLR_DATA_PIN), GPIO_OUTPUT_LOW);
+    gpio_pin_configure(gpio1_dev, NRF_GET_PIN(EPC901_CLR_PIX_PIN),  GPIO_OUTPUT_LOW);
+
+    /* Input — DATA_RDY from EPC901 */
+    gpio_pin_configure(gpio1_dev, NRF_GET_PIN(EPC901_DATA_RDY_PIN), GPIO_INPUT);
+
+    LOG_INF("EPC901 GPIO initialized.");
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * I2C Scan — run once at startup to discover EPC901 I2C address
+ * Remove or disable after address is confirmed.
+ * -------------------------------------------------------------------------- */
+static void i2c_scan(void)
+{
+    LOG_INF("Scanning I2C bus...");
+    for (uint8_t addr = 0x08; addr < 0x78; addr++) {
+        uint8_t dummy;
+        if (i2c_read(i2c_dev, &dummy, 1, addr) == 0) {
+            LOG_INF("  Found I2C device at 0x%02x", addr);
+        }
+    }
+    LOG_INF("I2C scan complete.");
+}
+
+/* --------------------------------------------------------------------------
+ * EPC901 I2C Init
+ * Configures sensor registers over I2C at startup.
+ * TODO: Confirm I2C address from PCB schematic CS0/CS1 config.
+ * -------------------------------------------------------------------------- */
+static int epc901_i2c_init(void)
+{
+    i2c_dev = DEVICE_DT_GET(DT_NODELABEL(i2c20));
+    if (!device_is_ready(i2c_dev)) {
+        LOG_ERR("I2C device not ready");
+        return -1;
+    }
+
+    /* Scan bus to verify EPC901 is present and find its address */
+    i2c_scan();
+
+    uint8_t chip_rev;
+    int ret = i2c_reg_read_byte(i2c_dev, EPC901_I2C_ADDR, 0xFF, &chip_rev);
+    if (ret != 0) {
+        LOG_ERR("EPC901 I2C read failed (err %d) — check address and wiring", ret);
+        return -1;
+    }
+    LOG_INF("EPC901 chip rev: 0x%02x", chip_rev);
+
+    /* MISC_CONF (0x02): preserve defaults, set RD_CONF_CTRL=1 (bit 0)
+     * Default = 0x98, set bit 0 → 0x99
+     * This enables I2C register control instead of hardware config pins */
+    i2c_reg_write_byte(i2c_dev, EPC901_I2C_ADDR, 0x02, 0x99);
+
+    /* ACQ_TX_CONF_I2C (0x00):
+     * HOR_BIN = 01 (no binning, bits 5:4)
+     * GAIN    = 01 (gain x1, bits 3:2)
+     * ROI_SEL = 0  (all 1024 pixels, bit 1)
+     * RD_DIR  = 0  (read 0→1023, bit 0)
+     * Value = 0b00010100 = 0x14 */
+    i2c_reg_write_byte(i2c_dev, EPC901_I2C_ADDR, 0x00, 0x14);
+
+    /* BW_VIDEO_CONF_IC2 (0x01):
+     * BW_VIDEO = 0101 → max bandwidth 16MHz (bits 3:0)
+     * Value = 0x05 */
+    i2c_reg_write_byte(i2c_dev, EPC901_I2C_ADDR, 0x01, 0x05);
+
+    LOG_INF("EPC901 I2C init complete.");
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * EPC901 Frame Capture Sequence
+ *
+ * Sequence per frame (from EPC901 datasheet):
+ *   1. CLR_PIX  — clear pixel array charge
+ *   2. CLR_DATA — clear data register
+ *   3. Integration period — sensor collects light
+ *   4. SHUTTER  — freeze the frame (end integration)
+ *   5. Wait DATA_RDY HIGH — frame ready to read
+ *   6. READ pulse — sensor starts outputting pixels on VIDEO_P
+ *   7. SAADC + TIMER22 samples VIDEO_P 1024 times at 1MHz automatically
+ *   8. SAADC EVT_DONE fires → capture_ready = true
+ *
+ * NOTE: This function only initiates the capture. The burst thread waits
+ * for capture_ready before packing and transmitting.
+ * -------------------------------------------------------------------------- */
+static void epc901_start_capture(void)
+{
+    /* 1. Clear pixel array */
+    gpio_pin_set(gpio1_dev, NRF_GET_PIN(EPC901_CLR_PIX_PIN), 1);
+    k_busy_wait(1);
+    gpio_pin_set(gpio1_dev, NRF_GET_PIN(EPC901_CLR_PIX_PIN), 0);
+
+    /* 2. Clear data register */
+    gpio_pin_set(gpio0_dev, NRF_GET_PIN(EPC901_CLR_DATA_PIN), 1);
+    k_busy_wait(1);
+    gpio_pin_set(gpio0_dev, NRF_GET_PIN(EPC901_CLR_DATA_PIN), 0);
+
+    /* 3. Integration period — sensor collects light
+     * Adjust this value for exposure. Start with 10ms for indoor testing. */
+    k_sleep(K_MSEC(10));
+
+    /* 4. SHUTTER — freeze the frame */
+    gpio_pin_set(gpio0_dev, NRF_GET_PIN(EPC901_SHUTTER_PIN), 1);
+    k_busy_wait(1);
+    gpio_pin_set(gpio0_dev, NRF_GET_PIN(EPC901_SHUTTER_PIN), 0);
+
+    /* 5. Wait for DATA_RDY HIGH (timeout 10ms) */
+    uint32_t timeout_us = 10000;
+    while (!gpio_pin_get(gpio1_dev, NRF_GET_PIN(EPC901_DATA_RDY_PIN))) {
+        k_busy_wait(1);
+        if (--timeout_us == 0) {
+            LOG_ERR("DATA_RDY timeout — check EPC901 wiring");
+            return;
+        }
+    }
+
+    /* 6. READ pulse — EPC901 starts clocking pixels onto VIDEO_P
+     * SAADC + TIMER22 via DPPI will sample automatically from this point */
+    gpio_pin_set(gpio0_dev, NRF_GET_PIN(EPC901_READ_PIN), 1);
+    k_busy_wait(1);
+    gpio_pin_set(gpio0_dev, NRF_GET_PIN(EPC901_READ_PIN), 0);
+
+    /* SAADC now captures 1024 samples autonomously via DPPI.
+     * capture_ready flag set by saadc_event_handler EVT_DONE. */
+}
+
+/* --------------------------------------------------------------------------
  * CCCD Callback
  * -------------------------------------------------------------------------- */
 static void epc901_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
@@ -315,13 +496,12 @@ BT_GATT_SERVICE_DEFINE(epc901_svc,
  * Burst Thread
  *
  * Flow per frame:
- *   1. Wait for capture_requested (set by CMD write)
+ *   1. Wait for capture_requested (set by CMD write from receiver)
  *   2. Abort any ongoing SAADC, re-arm buffers, re-trigger
- *   3. Wait for capture_ready (set by SAADC EVT_DONE)
- *   4. Pack 1024 x 10-bit → 1280 bytes
- *   5. Wait 100ms for MTU negotiation to complete
- *   6. Transmit in BLE notifications, falling back to 20-byte packets
- *      if the preferred 244-byte MTU is not yet available
+ *   3. Run EPC901 capture sequence (CLR → integrate → SHUTTER → READ)
+ *   4. Wait for capture_ready (set by SAADC EVT_DONE)
+ *   5. Pack 1024 x 10-bit → 1280 bytes
+ *   6. Transmit in BLE notifications
  * -------------------------------------------------------------------------- */
 void ble_burst_thread(void)
 {
@@ -342,7 +522,7 @@ void ble_burst_thread(void)
         nrfx_saadc_abort();
         k_sleep(K_MSEC(1));
 
-        /* Re-arm SAADC */
+        /* Re-arm SAADC buffers */
         capture_ready = false;
         saadc_current_buffer = 0;
 
@@ -362,7 +542,11 @@ void ble_burst_thread(void)
             continue;
         }
 
-        /* Wait for SAADC to fill one frame (1024 samples @ 1Msps = ~1ms) */
+        /* Run EPC901 capture sequence — initiates SAADC via READ pulse */
+        epc901_start_capture();
+
+        /* Wait for SAADC to fill one frame (1024 samples @ 1Msps = ~1ms)
+         * Timeout set generously to 500ms to account for integration time */
         uint32_t timeout = 500;
         while (!capture_ready && timeout > 0) {
             k_sleep(K_MSEC(1));
@@ -388,8 +572,8 @@ void ble_burst_thread(void)
         k_sleep(K_MSEC(100));
 
         /* Transmit in BLE notifications.
-         * Try preferred 244-byte packets first. If MTU hasn't been
-         * negotiated yet (-ENOMEM / -ENOBUFS), fall back to 20 bytes. */
+         * Try preferred 244-byte packets first. Fall back to 20 bytes
+         * if MTU hasn't been negotiated yet. */
         uint16_t tx_offset = 0;
         bool send_error = false;
 
@@ -401,7 +585,6 @@ void ble_burst_thread(void)
 
             if ((ble_err == -ENOMEM || ble_err == -ENOBUFS) &&
                 pkt_size > BLE_PACKET_SIZE_FALLBACK) {
-                /* MTU not negotiated yet — retry with minimum packet size */
                 pkt_size = BLE_PACKET_SIZE_FALLBACK;
                 ble_err = bt_gatt_notify(current_conn, &epc901_svc.attrs[2],
                                          &packed_buffer[tx_offset], pkt_size);
@@ -478,6 +661,12 @@ int main(void)
     configure_timer();
     configure_saadc();
     configure_ppi();
+
+    /* EPC901 hardware init
+     * These will log errors if the PCB is not yet connected — that is expected
+     * until the EPC901 is soldered and wired up. */
+    epc901_gpio_init();
+    epc901_i2c_init();
 
     if (bt_enable(NULL)) {
         LOG_ERR("Bluetooth init failed");
